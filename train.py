@@ -111,7 +111,7 @@ class Trainer:
                 f.write(OmegaConf.to_yaml(cfg, resolve=True))
 
         seed(cfg.training.seed)
-        log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
+        # log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
         self.datasets, traj_dsets = hydra.utils.call(
             self.cfg.env.dataset,
             num_hist=self.cfg.num_hist,
@@ -443,7 +443,7 @@ class Trainer:
         for i, data in enumerate(
             tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
-            obs, act, state = data
+            obs, act, state = data # [B, T, C, H, W]
             plot = i == 0  # only plot from the first batch
             self.model.train()
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(

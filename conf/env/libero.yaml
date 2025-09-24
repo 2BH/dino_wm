@@ -1,17 +1,15 @@
-name: wall
+name: libero
 args: []
 kwargs: {}
 
 dataset:
-  _target_: "dataset_module.wall_dset.load_wall_slice_train_val"
+  _target_: "dataset_module.libero_dset.load_libero_slice_train_val"
   n_rollout: null
   normalize_action: ${normalize_action}
-  data_path: ${oc.env:DATASET_DIR}/wall_single
   split_ratio: 0.9
-  split_mode: "random"
   transform:
     _target_: "dataset_module.img_transforms.default_transform"
-    img_size: ${img_size}
+    img_size: 256
 
 decoder_path: null
 num_workers: 16

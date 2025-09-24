@@ -190,8 +190,8 @@ class PlanEvaluator:  # evaluator for planning
     ):
         """
         i_visuals may have less frames than e_visuals due to frameskip, so pad accordingly
-        e_visuals: (b, t, h, w, c)
-        i_visuals: (b, t, h, w, c)
+        e_visuals: (b, t, h, w, c), e is the actual visuals from the env
+        i_visuals: (b, t, h, w, c), i is the reconstructed visuals
         goal: (b, h, w, c)
         """
         e_visuals = e_visuals[: self.n_plot_samples]

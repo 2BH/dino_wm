@@ -86,7 +86,7 @@ class PointMazeDataset(TrajDataset):
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
 
-        image = image[frames]  # THWC
+        image = image[frames]  # [T, H, W, C]
         image = image / 255.0
         image = rearrange(image, "T H W C -> T C H W")
         if self.transform:
