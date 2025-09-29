@@ -630,7 +630,7 @@ class Trainer:
             self.logs_update(loss_components)
 
     def openloop_rollout(
-        self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
+        self, dset, num_rollout=5, rand_start_end=True, min_horizon=2, mode="train"
     ):
         np.random.seed(self.cfg.training.seed)
         min_horizon = min_horizon + self.cfg.num_hist
