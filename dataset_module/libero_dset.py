@@ -9,7 +9,7 @@ from einops import rearrange
 from .traj_dset import TrajDataset
 
 
-class LiberoDataset(LeRobotDataset):
+class LiberoTrajSlicerDataset(LeRobotDataset):
     """
     Windowed Libero dataset backed by LeRobotDataset.
 
@@ -39,10 +39,10 @@ class LiberoDataset(LeRobotDataset):
     ):
         # Build delta timestamps to request a length-T window
         meta_data = LeRobotDatasetMetadata(repo_id)
-        delta_timestamps = { # TODO: Ensure the fps is correct
-            camera_key: [i * 1/meta_data.fps*frameskip for i in range(seq_len)],
-            state_key: [i * 1/meta_data.fps*frameskip for i in range(seq_len)],
-            action_key: [i * 1/meta_data.fps*frameskip for i in range(seq_len)],
+        delta_timestamps = {  # TODO: Ensure the fps is correct
+            camera_key: [i * frameskip / meta_data.fps for i in range(seq_len)],
+            state_key: [i * frameskip / meta_data.fps for i in range(seq_len)],
+            action_key: [i * meta_data.fps for i in range(seq_len * frameskip)],
         }
         self.transform = transform
         self.camera_key = camera_key
@@ -56,9 +56,13 @@ class LiberoDataset(LeRobotDataset):
         # Expose dims for trainers
         self.proprio_dim = meta_data.features[state_key]["shape"][-1]
         self.state_dim = meta_data.features[state_key]["shape"][-1]
-        self.action_dim = meta_data.features[action_key]["shape"][-1]
+        base_action_dim = meta_data.features[action_key]["shape"][-1]
+        self.raw_action_dim = base_action_dim
+        self.action_dim = base_action_dim * frameskip
 
         # Default stats (used by planners); will be refined if normalize_action
+        self._raw_action_mean = torch.zeros(self.raw_action_dim)
+        self._raw_action_std = torch.ones(self.raw_action_dim)
         self.action_mean = torch.zeros(self.action_dim)
         self.action_std = torch.ones(self.action_dim)
         self.state_mean = torch.zeros(self.state_dim)
@@ -67,10 +71,14 @@ class LiberoDataset(LeRobotDataset):
         self.proprio_std = torch.ones(self.proprio_dim)
 
         if self.normalize_action:
-            self.action_mean, self.action_std = self.get_data_mean_std(self.action_key, meta_data)
+            raw_action_mean, raw_action_std = self.get_data_mean_std(self.action_key, meta_data)
             self.state_mean, self.state_std = self.get_data_mean_std(self.state_key, meta_data)
             self.proprio_mean = self.state_mean.clone()
             self.proprio_std = self.state_std.clone()
+            self._raw_action_mean = raw_action_mean
+            self._raw_action_std = raw_action_std
+            self.action_mean = raw_action_mean.repeat(frameskip)
+            self.action_std = raw_action_std.repeat(frameskip)
 
     def get_data_mean_std(self, data_key, meta_data):
         mean = meta_data.stats[data_key]["mean"]
@@ -90,11 +98,6 @@ class LiberoDataset(LeRobotDataset):
         # assume (T, H, W, C)
         return rearrange(imgs, "t h w c -> t c h w")
 
-    def _norm_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        if not self.normalize_action:
-            return actions
-        return (actions - self.action_mean) / self.action_std
-
     def _norm_states(self, states: torch.Tensor) -> torch.Tensor:
         if not self.normalize_action: # TODO: add a new argument for this
             return states
@@ -108,10 +111,27 @@ class LiberoDataset(LeRobotDataset):
             imgs = self.transform(imgs)
         states = sample[self.state_key]
         actions = sample[self.action_key]
-        # normalize states and actions
+
+        # target_len = self.seq_len * self.frameskip
+        # if actions.shape[0] < target_len:
+        #     pad = torch.zeros(
+        #         (target_len - actions.shape[0], actions.shape[1]), dtype=actions.dtype
+        #     )
+        #     actions = torch.cat([actions, pad], dim=0)
+        # elif actions.shape[0] > target_len:
+        #     actions = actions[:target_len]
+
         if self.normalize_action:
-            actions = self._norm_actions(actions)
+            actions = (actions - self._raw_action_mean.to(actions.device)) / self._raw_action_std.to(actions.device)
             states = self._norm_states(states)
+
+        actions = rearrange(
+            actions,
+            "(t f) d -> t (f d)",
+            t=self.seq_len,
+            f=self.frameskip,
+        )
+
         obs = {"visual": imgs, "proprio": states}
         act = actions
         state = states
@@ -131,7 +151,6 @@ class LiberoTrajectoryDataset(TrajDataset):
         self,
         repo_id: str = "physical-intelligence/libero",
         episodes: List[int] | None = None,
-        frameskip: int = 1,
         camera_key: str = "observation.images.image",
         state_key: str = "observation.state",
         action_key: str = "action",
@@ -145,7 +164,6 @@ class LiberoTrajectoryDataset(TrajDataset):
         self.camera_key = camera_key
         self.state_key = state_key
         self.action_key = action_key
-        self.frameskip = max(1, frameskip)
         self.transform = transform
         self.normalize_action = normalize_action
 
@@ -190,7 +208,7 @@ class LiberoTrajectoryDataset(TrajDataset):
 
         episode_lengths = [self.meta_data.episodes[ep]["length"] for ep in self.episode_ids]
         self.seq_lengths = [
-            len(range(0, length, self.frameskip)) if length > 0 else 0
+            length if length > 0 else 0
             for length in episode_lengths
         ]
 
@@ -255,7 +273,7 @@ class LiberoTrajectoryDataset(TrajDataset):
         return frames
 
     def _load_episode_structured(self, start: int, end: int) -> dict:
-        indices = list(range(start, end, self.frameskip))
+        indices = list(range(start, end))
         batch = self.dataset.hf_dataset.select(indices)
         data = {
             "states": torch.stack([item.float() for item in batch[self.state_key]]),
@@ -368,7 +386,7 @@ def load_libero_slice_train_val(
     val_eps = indices[n_train:].tolist()
 
     meta_data = LeRobotDatasetMetadata(repo_id)
-    train_ds = LiberoDataset(
+    train_ds = LiberoTrajSlicerDataset(
         repo_id,
         episodes=train_eps,
         seq_len=num_frames,
@@ -379,7 +397,7 @@ def load_libero_slice_train_val(
         transform=transform,
         normalize_action=normalize_action,
     )
-    val_ds = LiberoDataset(
+    val_ds = LiberoTrajSlicerDataset(
         repo_id,
         episodes=val_eps,
         frameskip=frameskip,
@@ -393,7 +411,6 @@ def load_libero_slice_train_val(
     train_traj = LiberoTrajectoryDataset(
         repo_id=repo_id,
         episodes=train_eps,
-        frameskip=frameskip,
         camera_key=camera_key,
         state_key=state_key,
         action_key=action_key,
@@ -406,7 +423,6 @@ def load_libero_slice_train_val(
     val_traj = LiberoTrajectoryDataset(
         repo_id=repo_id,
         episodes=val_eps,
-        frameskip=frameskip,
         camera_key=camera_key,
         state_key=state_key,
         action_key=action_key,
