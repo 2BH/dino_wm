@@ -9,7 +9,7 @@ dataset:
   split_ratio: 0.9
   transform:
     _target_: "dataset_module.img_transforms.default_transform"
-    img_size: 256
+    img_size: 224
 
 decoder_path: null
 num_workers: 16

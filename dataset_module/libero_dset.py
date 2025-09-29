@@ -9,7 +9,7 @@ from einops import rearrange
 from .traj_dset import TrajDataset
 
 
-class LiberoDataset(TrajDataset):
+class LiberoDataset(LeRobotDataset):
     """
     Windowed Libero dataset backed by LeRobotDataset.
 
@@ -29,7 +29,7 @@ class LiberoDataset(TrajDataset):
         self,
         repo_id: str = "physical-intelligence/libero",
         episodes: List[int] | None = None,
-        num_frames: int = 20,
+        seq_len: int = 20,
         frameskip: int = 1,
         camera_key: str = "observation.images.image",
         state_key: str = "observation.state",
@@ -37,31 +37,26 @@ class LiberoDataset(TrajDataset):
         transform: Optional[Callable] = None,
         normalize_action: bool = False,
     ):
+        # Build delta timestamps to request a length-T window
+        meta_data = LeRobotDatasetMetadata(repo_id)
+        delta_timestamps = { # TODO: Ensure the fps is correct
+            camera_key: [i * 1/meta_data.fps*frameskip for i in range(seq_len)],
+            state_key: [i * 1/meta_data.fps*frameskip for i in range(seq_len)],
+            action_key: [i * 1/meta_data.fps*frameskip for i in range(seq_len)],
+        }
         self.transform = transform
         self.camera_key = camera_key
         self.state_key = state_key
         self.action_key = action_key
-        self.num_frames = num_frames
+        self.seq_len = seq_len
         self.normalize_action = normalize_action
-
-        # Build delta timestamps to request a length-T window
-        self.meta_data = LeRobotDatasetMetadata(repo_id)
-        self.fps = self.meta_data.fps
-        delta_timestamps = { # TODO: Ensure the fps is correct
-            camera_key: [i * 1/self.fps*frameskip for i in range(num_frames)],
-            state_key: [i * 1/self.fps*frameskip for i in range(num_frames)],
-            action_key: [i * 1/self.fps*frameskip for i in range(num_frames)],
-        }
-        self.dataset = LeRobotDataset(
-            repo_id,
-            delta_timestamps=delta_timestamps,
-            episodes=episodes,
-        )
+        self.frameskip = frameskip
+        super().__init__(repo_id, episodes=episodes, delta_timestamps=delta_timestamps)
 
         # Expose dims for trainers
-        self.proprio_dim = self.meta_data.features[state_key]["shape"][-1]
-        self.state_dim = self.meta_data.features[state_key]["shape"][-1]
-        self.action_dim = self.meta_data.features[action_key]["shape"][-1]
+        self.proprio_dim = meta_data.features[state_key]["shape"][-1]
+        self.state_dim = meta_data.features[state_key]["shape"][-1]
+        self.action_dim = meta_data.features[action_key]["shape"][-1]
 
         # Default stats (used by planners); will be refined if normalize_action
         self.action_mean = torch.zeros(self.action_dim)
@@ -72,26 +67,19 @@ class LiberoDataset(TrajDataset):
         self.proprio_std = torch.ones(self.proprio_dim)
 
         if self.normalize_action:
-            self.action_mean, self.action_std = self.get_data_mean_std(self.action_key)
-            self.state_mean, self.state_std = self.get_data_mean_std(self.state_key)
+            self.action_mean, self.action_std = self.get_data_mean_std(self.action_key, meta_data)
+            self.state_mean, self.state_std = self.get_data_mean_std(self.state_key, meta_data)
             self.proprio_mean = self.state_mean.clone()
             self.proprio_std = self.state_std.clone()
 
-    def get_data_mean_std(self, data_key):
-        mean = self.meta_data.stats[data_key]["mean"]
-        std = self.meta_data.stats[data_key]["std"]
+    def get_data_mean_std(self, data_key, meta_data):
+        mean = meta_data.stats[data_key]["mean"]
+        std = meta_data.stats[data_key]["std"]
         if isinstance(mean, np.ndarray):
             mean = torch.tensor(mean, dtype=torch.float32)
         if isinstance(std, np.ndarray):
             std = torch.tensor(std, dtype=torch.float32)
         return mean, std
-
-    # --- TrajDataset API ---
-    def get_seq_length(self, idx):
-        return self.num_frames
-
-    def __len__(self):
-        return len(self.dataset)
 
     def _maybe_to_chw(self, imgs: torch.Tensor) -> torch.Tensor:
         # Expect (T, C, H, W). If (T, H, W, C), convert.
@@ -113,34 +101,17 @@ class LiberoDataset(TrajDataset):
         return (states - self.state_mean) / self.state_std
 
     def __getitem__(self, idx):
-        sample: Dict[str, torch.Tensor] = self.dataset[idx]
-
+        sample = super().__getitem__(idx)
         imgs = sample[self.camera_key]
-        if isinstance(imgs, np.ndarray):
-            imgs = torch.from_numpy(imgs)
-        imgs = imgs.to(torch.float32)
-        if imgs.dtype == torch.uint8:
-            imgs = imgs.float() / 255.0
         imgs = self._maybe_to_chw(imgs)
         if self.transform is not None:
             imgs = self.transform(imgs)
-
         states = sample[self.state_key]
-        if isinstance(states, np.ndarray):
-            states = torch.from_numpy(states)
-        states = states.to(torch.float32)
-
         actions = sample[self.action_key]
-        if isinstance(actions, np.ndarray):
-            actions = torch.from_numpy(actions)
-        actions = actions.to(torch.float32)
-        # actions is (T-1, Da). Pad to (T, Da) by appending zeros on the last step
-        if actions.shape[0] == self.num_frames - 1:
-            pad = torch.zeros((1, actions.shape[1]), dtype=actions.dtype)
-            actions = torch.cat([actions, pad], dim=0)
-        actions = self._norm_actions(actions)
-        states = self._norm_states(states)
-
+        # normalize states and actions
+        if self.normalize_action:
+            actions = self._norm_actions(actions)
+            states = self._norm_states(states)
         obs = {"visual": imgs, "proprio": states}
         act = actions
         state = states
@@ -365,11 +336,13 @@ class _EmptyTrajDataset(TrajDataset):
 
 def load_libero_slice_train_val(
     transform,
+    # repo_id: str = "physical-intelligence/libero",
     repo_id: str = "lerobot/libero_goal_image",
     n_rollout: Optional[int] = None,
     split_ratio: float = 0.9,
     camera_key: str = "observation.images.image",
     state_key: str = "observation.state",
+    action_key: str = "action",
     normalize_action: bool = False,
     num_hist: int = 0,
     num_pred: int = 0,
@@ -390,30 +363,29 @@ def load_libero_slice_train_val(
     total_eps = LeRobotDatasetMetadata(repo_id).total_episodes
     n_train = int(split_ratio * total_eps)
     indices = np.arange(total_eps)
-    np.random.shuffle(indices)
+    # np.random.shuffle(indices)
     train_eps = indices[:n_train].tolist()
     val_eps = indices[n_train:].tolist()
 
+    meta_data = LeRobotDatasetMetadata(repo_id)
     train_ds = LiberoDataset(
-        repo_id=repo_id,
+        repo_id,
         episodes=train_eps,
-        num_frames=num_frames,
+        seq_len=num_frames,
         frameskip=frameskip,
         camera_key=camera_key,
         state_key=state_key,
-        action_key="action",
+        action_key=action_key,
         transform=transform,
         normalize_action=normalize_action,
     )
-
     val_ds = LiberoDataset(
-        repo_id=repo_id,
+        repo_id,
         episodes=val_eps,
-        num_frames=num_frames,
         frameskip=frameskip,
         camera_key=camera_key,
         state_key=state_key,
-        action_key="action",
+        action_key=action_key,
         transform=transform,
         normalize_action=normalize_action,
     )
@@ -424,11 +396,11 @@ def load_libero_slice_train_val(
         frameskip=frameskip,
         camera_key=camera_key,
         state_key=state_key,
-        action_key="action",
+        action_key=action_key,
         transform=transform,
         normalize_action=normalize_action,
-        base_dataset=train_ds.dataset,
-        meta_data=train_ds.meta_data,
+        base_dataset=train_ds,
+        meta_data=meta_data,
     )
 
     val_traj = LiberoTrajectoryDataset(
@@ -437,11 +409,11 @@ def load_libero_slice_train_val(
         frameskip=frameskip,
         camera_key=camera_key,
         state_key=state_key,
-        action_key="action",
+        action_key=action_key,
         transform=transform,
         normalize_action=normalize_action,
-        base_dataset=val_ds.dataset,
-        meta_data=val_ds.meta_data,
+        base_dataset=val_ds,
+        meta_data=meta_data,
     )
 
     datasets = {"train": train_ds, "valid": val_ds}
