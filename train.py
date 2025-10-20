@@ -558,76 +558,77 @@ class Trainer:
             obs, act, state = data
             plot = i == 0
             self.model.eval()
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                obs, act
-            )
-
-            loss = self.accelerator.gather_for_metrics(loss).mean()
-
-            loss_components = self.accelerator.gather_for_metrics(loss_components)
-            loss_components = {
-                key: value.mean().item() for key, value in loss_components.items()
-            }
-
-            if self.cfg.has_decoder and plot:
-                # only eval images when plotting due to speed
-                if self.cfg.has_predictor:
-                    z_obs_out, z_act_out = self.model.separate_emb(z_out)
-                    z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
-
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
-                    err_logs = self.err_eval(z_obs_out, z_tgt)
-
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
-                    err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
-                    }
-                    err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
-
-                    self.logs_update(err_logs)
-
-                if visual_out is not None:
-                    for t in range(
-                        self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
-                    ):
-                        img_pred_scores = eval_images(
-                            visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
-                        )
-                        img_pred_scores = self.accelerator.gather_for_metrics(
-                            img_pred_scores
-                        )
-                        img_pred_scores = {
-                            f"val_img_{k}_pred": [v.mean().item()]
-                            for k, v in img_pred_scores.items()
-                        }
-                        self.logs_update(img_pred_scores)
-
-                if visual_reconstructed is not None:
-                    for t in range(obs["visual"].shape[1]):
-                        img_reconstruction_scores = eval_images(
-                            visual_reconstructed[:, t], obs["visual"][:, t]
-                        )
-                        img_reconstruction_scores = self.accelerator.gather_for_metrics(
-                            img_reconstruction_scores
-                        )
-                        img_reconstruction_scores = {
-                            f"val_img_{k}_reconstructed": [v.mean().item()]
-                            for k, v in img_reconstruction_scores.items()
-                        }
-                        self.logs_update(img_reconstruction_scores)
-
-                self.plot_samples(
-                    obs["visual"],
-                    visual_out,
-                    visual_reconstructed,
-                    self.epoch,
-                    batch=i,
-                    num_samples=self.num_reconstruct_samples,
-                    phase="valid",
+            with torch.no_grad():
+                z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
+                    obs, act
                 )
-            loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
-            self.logs_update(loss_components)
+
+                loss = self.accelerator.gather_for_metrics(loss).mean()
+
+                loss_components = self.accelerator.gather_for_metrics(loss_components)
+                loss_components = {
+                    key: value.mean().item() for key, value in loss_components.items()
+                }
+
+                if self.cfg.has_decoder and plot:
+                    # only eval images when plotting due to speed
+                    if self.cfg.has_predictor:
+                        z_obs_out, z_act_out = self.model.separate_emb(z_out)
+                        z_gt = self.model.encode_obs(obs)
+                        z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
+
+                        state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
+                        err_logs = self.err_eval(z_obs_out, z_tgt)
+
+                        err_logs = self.accelerator.gather_for_metrics(err_logs)
+                        err_logs = {
+                            key: value.mean().item() for key, value in err_logs.items()
+                        }
+                        err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
+
+                        self.logs_update(err_logs)
+
+                    if visual_out is not None:
+                        for t in range(
+                            self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
+                        ):
+                            img_pred_scores = eval_images(
+                                visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
+                            )
+                            img_pred_scores = self.accelerator.gather_for_metrics(
+                                img_pred_scores
+                            )
+                            img_pred_scores = {
+                                f"val_img_{k}_pred": [v.mean().item()]
+                                for k, v in img_pred_scores.items()
+                            }
+                            self.logs_update(img_pred_scores)
+
+                    if visual_reconstructed is not None:
+                        for t in range(obs["visual"].shape[1]):
+                            img_reconstruction_scores = eval_images(
+                                visual_reconstructed[:, t], obs["visual"][:, t]
+                            )
+                            img_reconstruction_scores = self.accelerator.gather_for_metrics(
+                                img_reconstruction_scores
+                            )
+                            img_reconstruction_scores = {
+                                f"val_img_{k}_reconstructed": [v.mean().item()]
+                                for k, v in img_reconstruction_scores.items()
+                            }
+                            self.logs_update(img_reconstruction_scores)
+
+                    self.plot_samples(
+                        obs["visual"],
+                        visual_out,
+                        visual_reconstructed,
+                        self.epoch,
+                        batch=i,
+                        num_samples=self.num_reconstruct_samples,
+                        phase="valid",
+                    )
+                loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
+                self.logs_update(loss_components)
 
     def openloop_rollout(
         self, dset, num_rollout=5, rand_start_end=True, min_horizon=2, mode="train"
