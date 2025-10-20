@@ -30,7 +30,7 @@ class DinoV3Encoder(nn.Module):
     def __init__(self, name, feature_key):
         super().__init__()
         self.name = name
-        PATH_TO_MODEL = os.environ["HOME"] + "/ws/dinov3" # os.environ["HOME"]+"/ws/dinov3"
+        PATH_TO_MODEL = "/work/dlclarge2/zhangb-WM/dinov3" # os.environ["HOME"]+"/ws/dinov3"
         PATH_TO_WEIGHTS = PATH_TO_MODEL+"/checkpoints/"+name+"_pretrain.pth"
         self.base_model = torch.hub.load(PATH_TO_MODEL, model=name, source='local', weights=PATH_TO_WEIGHTS)
         self.feature_key = feature_key
@@ -49,4 +49,3 @@ class DinoV3Encoder(nn.Module):
         if self.latent_ndim == 1:
             emb = emb.unsqueeze(1) # dummy patch dim
         return emb
-         

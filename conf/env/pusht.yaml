@@ -14,6 +14,12 @@ dataset:
   transform:
     _target_: "dataset_module.img_transforms.default_transform"
     img_size: ${img_size}
+  use_precomputed_embeddings: ${model.use_precomputed_embeddings}
+  embeddings_subdir: "dinov2_embeddings"
+  use_waypoints: ${model.use_waypoint_mode}
+  waypoints_subdir: "waypoints.pkl"
+  waypoint_mode: "frameskip"  # "frameskip" or "waypoint_only"
 
 decoder_path: null
 num_workers: 16
+prefetch_factor: 2

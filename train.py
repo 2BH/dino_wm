@@ -121,6 +121,19 @@ class Trainer:
 
         self.train_traj_dset = traj_dsets["train"]
         self.val_traj_dset = traj_dsets["valid"]
+        
+        # Store waypoint configuration for conditional rollout
+        self.use_waypoints = self.cfg.env.dataset.get("use_waypoints", False)
+        self.waypoint_mode = self.cfg.env.dataset.get("waypoint_mode", "frameskip")
+        
+        # Disable openloop rollout for waypoint frameskip mode (inconsistent with training)
+        # But allow it for waypoint_only mode (consistent waypoint-to-waypoint prediction)
+        self.enable_openloop_rollout = True
+        if self.use_waypoints and self.waypoint_mode == "frameskip":
+            self.enable_openloop_rollout = False
+            log.info("⚠️  Openloop rollout DISABLED for waypoint frameskip mode (architectural mismatch)")
+        elif self.use_waypoints and self.waypoint_mode == "waypoint_only":
+            log.info("✓ Openloop rollout ENABLED for waypoint_only mode")
 
         self.dataloaders = {
             x: torch.utils.data.DataLoader(
@@ -440,12 +453,31 @@ class Trainer:
         return logs
 
     def train(self):
+        if self.cfg.debug:
+            log.info("🐛 DEBUG MODE: Processing only the first batch")
+            print(f"🐛 DEBUG MODE: Encoder type: {type(self.encoder)}")
+        
         for i, data in enumerate(
             tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
             obs, act, state = data # [B, T, C, H, W]
             plot = i == 0  # only plot from the first batch
             self.model.train()
+            
+            # Debug mode: skip all batches except the first one
+            if self.cfg.debug and i > 0:
+                break
+            
+            # Debug: print shapes
+            if self.cfg.debug and i == 0:
+                log.info(f"🐛 DEBUG: Data shapes:")
+                for k, v in obs.items():
+                    log.info(f"   obs['{k}']: {v.shape}")
+                log.info(f"   act: {act.shape}")
+                log.info(f"   state: {state.shape}")
+                log.info(f"   dataset.proprio_dim: {self.datasets['train'].proprio_dim}")
+                log.info(f"   dataset.action_dim: {self.datasets['train'].action_dim}")
+            
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
                 obs, act
             )
@@ -496,7 +528,7 @@ class Trainer:
                         self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
                     ):
                         img_pred_scores = eval_images(
-                            visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
+                            visual_out[:, t - self.cfg.num_pred], obs["visual_raw"][:, t]
                         )
                         img_pred_scores = self.accelerator.gather_for_metrics(
                             img_pred_scores
@@ -508,9 +540,9 @@ class Trainer:
                         self.logs_update(img_pred_scores)
 
                 if visual_reconstructed is not None:
-                    for t in range(obs["visual"].shape[1]):
+                    for t in range(obs["visual_raw"].shape[1]):
                         img_reconstruction_scores = eval_images(
-                            visual_reconstructed[:, t], obs["visual"][:, t]
+                            visual_reconstructed[:, t], obs["visual_raw"][:, t]
                         )
                         img_reconstruction_scores = self.accelerator.gather_for_metrics(
                             img_reconstruction_scores
@@ -522,7 +554,7 @@ class Trainer:
                         self.logs_update(img_reconstruction_scores)
 
                 self.plot_samples(
-                    obs["visual"],
+                    obs["visual_raw"],
                     visual_out,
                     visual_reconstructed,
                     self.epoch,
@@ -536,7 +568,7 @@ class Trainer:
 
     def val(self):
         self.model.eval()
-        if len(self.train_traj_dset) > 0 and self.cfg.has_predictor:
+        if len(self.train_traj_dset) > 0 and self.cfg.has_predictor and self.enable_openloop_rollout:
             with torch.no_grad():
                 train_rollout_logs = self.openloop_rollout(
                     self.train_traj_dset, mode="train"
@@ -558,6 +590,10 @@ class Trainer:
             obs, act, state = data
             plot = i == 0
             self.model.eval()
+            
+            # Debug mode: skip all batches except the first one
+            if self.cfg.debug and i > 0:
+                continue
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
                 obs, act
             )
@@ -592,7 +628,7 @@ class Trainer:
                         self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
                     ):
                         img_pred_scores = eval_images(
-                            visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
+                            visual_out[:, t - self.cfg.num_pred], obs["visual_raw"][:, t]
                         )
                         img_pred_scores = self.accelerator.gather_for_metrics(
                             img_pred_scores
@@ -604,9 +640,9 @@ class Trainer:
                         self.logs_update(img_pred_scores)
 
                 if visual_reconstructed is not None:
-                    for t in range(obs["visual"].shape[1]):
+                    for t in range(obs["visual_raw"].shape[1]):
                         img_reconstruction_scores = eval_images(
-                            visual_reconstructed[:, t], obs["visual"][:, t]
+                            visual_reconstructed[:, t], obs["visual_raw"][:, t]
                         )
                         img_reconstruction_scores = self.accelerator.gather_for_metrics(
                             img_reconstruction_scores
@@ -618,7 +654,7 @@ class Trainer:
                         self.logs_update(img_reconstruction_scores)
 
                 self.plot_samples(
-                    obs["visual"],
+                    obs["visual_raw"],
                     visual_out,
                     visual_reconstructed,
                     self.epoch,
@@ -648,33 +684,76 @@ class Trainer:
             valid_traj = False
             while not valid_traj:
                 traj_idx = np.random.randint(0, len(dset))
-                obs, act, state, _ = dset[traj_idx]
+                obs, act, state, info = dset[traj_idx]
                 act = act.to(self.device)
-                if rand_start_end:
-                    if obs["visual"].shape[0] > min_horizon * self.cfg.frameskip + 1:
-                        start = np.random.randint(
-                            0,
-                            obs["visual"].shape[0] - min_horizon * self.cfg.frameskip - 1,
-                        )
+                
+                # Waypoint only mode: use waypoints instead of frameskip
+                if self.use_waypoints and self.waypoint_mode == "waypoint_only":
+                    waypoints = info.get('waypoints', None)
+                    if waypoints is None:
+                        continue  # Skip trajectories without waypoints
+                    
+                    # Convert waypoints to numpy array if needed
+                    if isinstance(waypoints, torch.Tensor):
+                        waypoints = waypoints.cpu().numpy()
+                    elif not isinstance(waypoints, np.ndarray):
+                        waypoints = np.array(waypoints)
+                    
+                    if len(waypoints) < min_horizon:
+                        continue  # Need at least min_horizon waypoints
+                    
+                    if rand_start_end:
+                        if len(waypoints) > min_horizon:
+                            start_wp_idx = np.random.randint(0, len(waypoints) - min_horizon)
+                            end_wp_idx = np.random.randint(start_wp_idx + min_horizon, len(waypoints) + 1)
+                        else:
+                            start_wp_idx = 0
+                            end_wp_idx = len(waypoints)
                     else:
-                        start = 0
-                    max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
-                    if max_horizon > min_horizon:
-                        valid_traj = True
-                        horizon = np.random.randint(min_horizon, max_horizon + 1)
-                else:
+                        start_wp_idx = 0
+                        end_wp_idx = len(waypoints)
+                    
+                    # Extract waypoint indices
+                    selected_waypoints = waypoints[start_wp_idx:end_wp_idx]
+                    
+                    # Slice observations at waypoints
+                    for k in obs.keys():
+                        obs[k] = obs[k][selected_waypoints]
+                    
+                    # Compute delta actions between waypoints
+                    waypoint_states = state[selected_waypoints]
+                    positions = waypoint_states[:, :2]  # (num_waypoints, 2)
+                    act = positions[1:] - positions[:-1]  # (num_waypoints-1, 2)
+                    act = act.to(self.device)
+                    
                     valid_traj = True
-                    start = 0
-                    horizon = (obs["visual"].shape[0] - 1) // self.cfg.frameskip
+                else:
+                    # Standard frameskip mode
+                    if rand_start_end:
+                        if obs["visual_raw"].shape[0] > min_horizon * self.cfg.frameskip + 1:
+                            start = np.random.randint(
+                                0,
+                                obs["visual_raw"].shape[0] - min_horizon * self.cfg.frameskip - 1,
+                            )
+                        else:
+                            start = 0
+                        max_horizon = (obs["visual_raw"].shape[0] - start - 1) // self.cfg.frameskip
+                        if max_horizon > min_horizon:
+                            valid_traj = True
+                            horizon = np.random.randint(min_horizon, max_horizon + 1)
+                    else:
+                        valid_traj = True
+                        start = 0
+                        horizon = (obs["visual_raw"].shape[0] - 1) // self.cfg.frameskip
 
-            for k in obs.keys():
-                obs[k] = obs[k][
-                    start : 
-                    start + horizon * self.cfg.frameskip + 1 : 
-                    self.cfg.frameskip
-                ]
-            act = act[start : start + horizon * self.cfg.frameskip]
-            act = rearrange(act, "(h f) d -> h (f d)", f=self.cfg.frameskip)
+                    for k in obs.keys():
+                        obs[k] = obs[k][
+                            start : 
+                            start + horizon * self.cfg.frameskip + 1 : 
+                            self.cfg.frameskip
+                        ]
+                    act = act[start : start + horizon * self.cfg.frameskip]
+                    act = rearrange(act, "(h f) d -> h (f d)", f=self.cfg.frameskip)
 
             obs_g = {}
             for k in obs.keys():
@@ -708,10 +787,10 @@ class Trainer:
 
                 if self.cfg.has_decoder:
                     visuals = self.model.decode_obs(z_obses)[0]["visual"]
-                    imgs = torch.cat([obs["visual"], visuals[0].cpu()], dim=0)
+                    imgs = torch.cat([obs["visual_raw"], visuals[0].cpu()], dim=0)
                     self.plot_imgs(
                         imgs,
-                        obs["visual"].shape[0],
+                        obs["visual_raw"].shape[0],
                         f"{plotting_dir}/e{self.epoch}_{mode}_{idx}{postfix}.png",
                     )
         logs = {

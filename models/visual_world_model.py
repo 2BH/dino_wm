@@ -22,10 +22,13 @@ class VWorldModel(nn.Module):
         train_encoder=True,
         train_predictor=False,
         train_decoder=True,
+        use_precomputed_embeddings=False,
+        use_waypoint_mode=False,
     ):
         super().__init__()
         self.num_hist = num_hist
         self.num_pred = num_pred
+        self.use_waypoint_mode = use_waypoint_mode
         self.encoder = encoder
         self.proprio_encoder = proprio_encoder
         self.action_encoder = action_encoder
@@ -39,6 +42,7 @@ class VWorldModel(nn.Module):
         self.proprio_dim = proprio_dim * num_proprio_repeat 
         self.action_dim = action_dim * num_action_repeat 
         self.emb_dim = self.encoder.emb_dim + (self.action_dim + self.proprio_dim) * (concat_dim) # Not used
+        self.use_precomputed_embeddings = use_precomputed_embeddings
 
         print(f"num_action_repeat: {self.num_action_repeat}")
         print(f"num_proprio_repeat: {self.num_proprio_repeat}")
@@ -90,11 +94,26 @@ class VWorldModel(nn.Module):
 
     def encode(self, obs, act): 
         """
-        input :  obs (dict): "visual", "proprio", (b, num_frames, 3, img_size, img_size) 
+        input :  obs (dict): "visual", "proprio", (b, num_frames, 3, img_size, img_size)
+                 act: (b, num_actions, action_dim)
         output:    z (tensor): (b, num_frames, num_patches, emb_dim)
+        
+        In waypoint mode: obs has num_hist+1 frames, act has num_hist actions.
+        We pad act with a zero action for the last frame.
         """
         z_dct = self.encode_obs(obs)
+        
+        # Handle action dimension mismatch in waypoint mode
+        b, t_obs = z_dct['visual'].shape[:2]
+        t_act = act.shape[1]
+        
+        if t_act < t_obs:
+            # Pad actions with zeros for extra observation frames
+            pad_actions = torch.zeros(b, t_obs - t_act, act.shape[2], device=act.device, dtype=act.dtype)
+            act = torch.cat([act, pad_actions], dim=1)
+        
         act_emb = self.encode_act(act)
+        
         if self.concat_dim == 0:
             z = torch.cat(
                     [z_dct['visual'], z_dct['proprio'].unsqueeze(2), act_emb.unsqueeze(2)], dim=2 # add as an extra token
@@ -119,15 +138,21 @@ class VWorldModel(nn.Module):
 
     def encode_obs(self, obs):
         """
-        input : obs (dict): "visual", "proprio" (b, t, 3, img_size, img_size)
+        input : obs (dict): "visual", "proprio" (b, t, 3, img_size, img_size) or (b, t, num_patches, emb_dim) if precomputed
         output:   z (dict): "visual", "proprio" (b, t, num_patches, encoder_emb_dim)
         """
         visual = obs['visual']
         b = visual.shape[0]
-        visual = rearrange(visual, "b t ... -> (b t) ...")
-        visual = self.encoder_transform(visual)
-        visual_embs = self.encoder.forward(visual)
-        visual_embs = rearrange(visual_embs, "(b t) p d -> b t p d", b=b)
+        
+        if self.use_precomputed_embeddings:
+            # Visual is already embeddings with shape (b, t, num_patches, emb_dim)
+            visual_embs = visual
+        else:
+            # Standard encoder pipeline
+            visual = rearrange(visual, "b t ... -> (b t) ...")
+            visual = self.encoder_transform(visual)
+            visual_embs = self.encoder.forward(visual)
+            visual_embs = rearrange(visual_embs, "(b t) p d -> b t p d", b=b)
 
         proprio = obs['proprio']
         proprio_emb = self.encode_proprio(proprio)
@@ -193,15 +218,30 @@ class VWorldModel(nn.Module):
         output: z_pred: (b, num_hist, num_patches, emb_dim)
                 visual_pred: (b, num_hist, 3, img_size, img_size)
                 visual_reconstructed: (b, num_frames, 3, img_size, img_size)
+        
+        In waypoint mode with teacher forcing:
+            obs has shape (b, num_hist+1, ...) where frames are [T1, T3, ..., T_last, T_waypoint]
+            act has shape (b, num_hist, action_dim) - delta actions: [T1->T3, ..., T_last->T_waypoint]
+            Model predicts: T3, T5, ..., T_last, T_waypoint using teacher forcing
         """
         loss = 0
         loss_components = {}
         z = self.encode(obs, act)
+        
+        # Use visual_raw for decoder targets if available (when using precomputed embeddings)
+        # Otherwise use visual (which contains actual images in non-precomputed mode)
+        visual_for_decoder = obs.get('visual_raw', obs['visual'])
+        
+        if self.use_waypoint_mode:
+            # In waypoint mode with teacher forcing:
+            # z has shape (b, num_hist+1, num_patches, dim)
+            # Use frames 0 to num_hist-1 to predict frames 1 to num_hist (including waypoint)
+            if self.num_pred != 1:
+                raise ValueError(f"num_pred must be 1 in waypoint mode as we only predict the next waypoint, got {self.num_pred}")
         z_src = z[:, : self.num_hist, :, :]  # (b, num_hist, num_patches, dim)
         z_tgt = z[:, self.num_pred :, :, :]  # (b, num_hist, num_patches, dim)
-        visual_src = obs['visual'][:, : self.num_hist, ...]  # (b, num_hist, 3, img_size, img_size)
-        visual_tgt = obs['visual'][:, self.num_pred :, ...]  # (b, num_hist, 3, img_size, img_size)
-
+        visual_src = visual_for_decoder[:, : self.num_hist, ...]  # (b, num_hist, 3, img_size, img_size)
+        visual_tgt = visual_for_decoder[:, self.num_pred :, ...]  # (b, num_hist, 3, img_size, img_size)
         if self.predictor is not None:
             z_pred = self.predict(z_src)
             if self.decoder is not None:
@@ -251,7 +291,7 @@ class VWorldModel(nn.Module):
                 z.detach()
             )  # recon loss should only affect decoder
             visual_reconstructed = obs_reconstructed["visual"]
-            recon_loss_reconstructed = self.decoder_criterion(visual_reconstructed, obs['visual'])
+            recon_loss_reconstructed = self.decoder_criterion(visual_reconstructed, visual_for_decoder)
             decoder_loss_reconstructed = (
                 recon_loss_reconstructed
                 + self.decoder_latent_loss_weight * diff_reconstructed

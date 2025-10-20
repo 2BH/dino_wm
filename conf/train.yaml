@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - env: point_maze
-  - encoder: dino 
+  - encoder: dino
   - action_encoder: proprio
   - proprio_encoder: proprio
   - decoder: vqvae
@@ -17,22 +17,28 @@ hydra:
   sweep:
     dir: ${ckpt_base_path}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
     subdir: ${hydra.job.num}
+  verbose: true  # Enable verbose error messages
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
     nodes: 1
-    tasks_per_node: 1
-    cpus_per_task: 8
-    mem_gb: 512
-    gres: "gpu:h100:1"
-    timeout_min: 2880
-    setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
-            export MASTER_ADDR="$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
-            "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
-
+    partition: nrdlc2_gpu-h200
+    # partition: nrdlc2_gpu-l40s
+    tasks_per_node: 4
+    cpus_per_task: 16  # Reduced from 32 to avoid over-requesting (4 tasks * 8 cpus = 32 total)
+    mem_gb: 200
+    # gres: "gpu:h100:1"
+    gres: "gpu:4"
+    timeout_min: 1400
+    setup:
+      - "source /home/zhangb/miniforge3/etc/profile.d/conda.sh && conda activate dino_wm"
+      - "export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)"
+      - "export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)"
+      - "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)"
 training:
   seed: 0
   epochs: 100
-  batch_size: 32 # should >= nodes * tasks_per_node
+  # batch_size: 32 # should >= nodes * tasks_per_node
+  batch_size: 128 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
   reconstruct_every_x_batch: 500
   num_reconstruct_samples: 6
@@ -68,6 +74,8 @@ model:
   train_encoder: False
   train_predictor: True
   train_decoder: True
+  use_waypoint_mode: False
+  use_precomputed_embeddings: False
 
 debug: False 
 
